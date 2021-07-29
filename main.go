@@ -16,9 +16,12 @@ func main() {
 		panic(err)
 	} else {
 		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+		muxParser := MuxParser{
+			ApplicationProto: ThriftParser{},
+		}
 		for packet := range packetSource.Packets() {
-			if err := handlePacket(packet); err != nil {
-				fmt.Printf("Failed to handlePacket with error: %v\n", err)
+			if err := muxParser.Parse(packet); err != nil {
+				fmt.Printf("Failed to parse mux packet with error: %v\n", err)
 			}
 		}
 	}
@@ -30,34 +33,71 @@ type MuxPacket struct {
 	Type       int8
 	tag        [3]int8
 	discardTag [3]int8
-	Why        []byte
+	Why        string
 	NumCtx     uint16
 	Ctx        map[string]map[string]interface{}
+	Dest       string
+	Dtabs      map[string]string
 }
 
 func (m MuxPacket) Tag() uint32 {
 	return uint32(m.tag[0])<<16 | uint32(m.tag[1])<<8 | uint32(m.tag[2])
 }
 
-func (m MuxPacket) DiscardTag() uint32 {
-	return uint32(m.discardTag[0])<<16 | uint32(m.discardTag[1])<<8 | uint32(m.discardTag[2])
+type ProtoParser interface {
+	Parse(r *bytes.Reader) error
 }
 
-func handlePacket(packet gopacket.Packet) error {
-	// fmt.Println(packet.Dump())
+type ThriftParser struct {
+}
+
+func (p ThriftParser) Parse(r *bytes.Reader) error {
+	l := r.Len()
+	if l < 12 {
+		fmt.Printf("Payload too small to contain thrift data\n\n")
+		return nil
+	}
+
+	// r.ReadByte()
+	// r.ReadByte()
+	// r.ReadByte()
+	// r.ReadByte()
+	v, err := r.ReadByte()
+	if err != nil {
+		return err
+	}
+
+	// int(v) xor 0x80 == 1
+	if int(v) != 128 {
+		fmt.Printf("Payload does not conform to thrift standard: %d\n", int(v))
+		return nil
+	}
+
+	return nil
+}
+
+type NullParser struct{}
+
+func (p NullParser) Parse(r *bytes.Reader) error {
+	return nil
+}
+
+type MuxParser struct {
+	ApplicationProto ProtoParser
+}
+
+func (p MuxParser) Parse(packet gopacket.Packet) error {
+
 	layer := packet.ApplicationLayer()
 
 	// This packet doesn't contain any mux information
 	if layer == nil {
 		return nil
 	}
+
 	fmt.Println(gopacket.LayerDump(layer))
-	// payload := layer.Payload()
 	mux := &MuxPacket{}
 	r := bytes.NewReader(layer.Payload())
-	// if err := struc.Unpack(r, mux); err != nil {
-	// 	return
-	// }
 
 	err := binary.Read(r, binary.BigEndian, &mux.SizeHeader)
 	if err != nil {
@@ -74,22 +114,12 @@ func handlePacket(packet gopacket.Packet) error {
 		return err
 	}
 
-	// TODO: This isn't working yet
 	if mux.Type == 127 || mux.Type == -128 {
-		err = binary.Read(r, binary.BigEndian, &mux.Why)
+		why, err := ioutil.ReadAll(r)
 		if err != nil {
 			return err
 		}
-	}
-
-	// TODO: This is untested at the moment
-	if mux.Type == 66 || mux.Type == -62 {
-		err = binary.Read(r, binary.BigEndian, &mux.discardTag)
-		if err != nil {
-			return err
-		}
-
-		// TODO: "Why" should be read after this
+		mux.Why = string(why)
 	}
 
 	if mux.Type == 2 {
@@ -134,11 +164,63 @@ func handlePacket(packet gopacket.Packet) error {
 		}
 		mux.Ctx = context
 
-		// TODO: Need to update to parse dest and dtabs
+		// TODO: Dest parsing is untested at this point
+		var destLen uint16
+		err = binary.Read(r, binary.BigEndian, &destLen)
+		if err != nil {
+			return err
+		}
+
+		dest, err := ioutil.ReadAll(io.LimitReader(r, int64(destLen)))
+
+		if err != nil {
+			return err
+		}
+
+		mux.Dest = string(dest)
+
+		// TODO: dtab parsing is untested at this point
+		var numDtabs uint16
+		err = binary.Read(r, binary.BigEndian, &numDtabs)
+		if err != nil {
+			return err
+		}
+
+		dtabs := map[string]string{}
+		for i := 0; i < int(numDtabs); i++ {
+			var srcLen uint16
+
+			err := binary.Read(r, binary.BigEndian, &srcLen)
+			if err != nil {
+				return err
+			}
+
+			src, err := ioutil.ReadAll(io.LimitReader(r, int64(srcLen)))
+			if err != nil {
+				return err
+			}
+
+			var destLen uint16
+
+			err = binary.Read(r, binary.BigEndian, &destLen)
+			if err != nil {
+				return err
+			}
+
+			dest, err := ioutil.ReadAll(io.LimitReader(r, int64(destLen)))
+			if err != nil {
+				return err
+			}
+
+			dtabs[string(src)] = string(dest)
+		}
+
+		mux.Dtabs = dtabs
 	}
 
-	fmt.Printf("Size header: %d Type: %d Tag: %v Why: %s NumCtx: %d Ctx: %v\n", mux.SizeHeader, mux.Type, mux.Tag(), string(mux.Why), mux.NumCtx, mux.Ctx)
-	return nil
+	fmt.Printf("Size header: %d Type: %d Tag: %v Why: %s NumCtx: %d Ctx: %v Dest: %s Dtabs: %v Payload length: %d\n", mux.SizeHeader, mux.Type, mux.Tag(), string(mux.Why), mux.NumCtx, mux.Ctx, mux.Dest, mux.Dtabs, r.Len())
+
+	return p.ApplicationProto.Parse(r)
 }
 
 func decodeCtx(ctxKey string, ctxValue []byte) (map[string]interface{}, error) {
@@ -163,7 +245,7 @@ func decodeCtx(ctxKey string, ctxValue []byte) (map[string]interface{}, error) {
 		}, nil
 	case "com.twitter.finagle.thrift.ClientIdContext":
 		// utf-8 string
-		// TODO: This needs to be validated
+		// TODO: This has not been tested
 		return map[string]interface{}{
 			"name": string(ctxValue),
 		}, nil
