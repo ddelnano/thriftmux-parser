@@ -28,3 +28,6 @@ The following is a list of unsupported or untested features:
   - dest - implemented but untested
   - dtabs - implemented but untested
   - com.twitter.finagle.thrift.ClientIdContext - implemented but untested
+  - tls (unsupported)
+  - mux-framer (unsupported)
+  - compress / accept-compress (unsupported)
