@@ -11,6 +11,57 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
+const (
+	ThriftBool = iota + 2
+	ThriftByte
+	ThriftDouble
+	_
+	ThriftI16
+	_
+	ThriftI32
+	_
+	ThriftI64
+	ThriftString
+	ThriftStruct
+	ThriftMap
+	ThriftSet
+	ThriftList
+)
+
+const (
+	Treq = 1
+	Rreq = -1
+
+	Tdispatch = 2
+	Rdispatch = -2
+
+	// control messages
+	Tdrain = 64
+	Rdrain = -64
+	Tping  = 65
+	Rping  = -65
+
+	Tdiscarded = 66
+	Rdiscarded = -66
+
+	Tlease = 67
+
+	Tinit = 68
+	Rinit = -68
+
+	Rerr = -128
+
+	// only used to preserve backwards compatibility
+	TdiscardedOld = -62
+	RerrOld       = 127
+)
+
+const (
+	MuxReplyOk = iota
+	MuxReplyError
+	MuxReplyNack
+)
+
 func main() {
 	if handle, err := pcap.OpenOffline("./mux.pcap"); err != nil {
 		panic(err)
@@ -29,15 +80,16 @@ func main() {
 }
 
 type MuxPacket struct {
-	SizeHeader uint32
-	Type       int8
-	tag        [3]int8
-	discardTag [3]int8
-	Why        string
-	NumCtx     uint16
-	Ctx        map[string]map[string]interface{}
-	Dest       string
-	Dtabs      map[string]string
+	SizeHeader  uint32
+	Type        int8
+	tag         [3]int8
+	discardTag  [3]int8
+	Why         string
+	NumCtx      uint16
+	Ctx         map[string]map[string]interface{}
+	Dest        string
+	Dtabs       map[string]string
+	ReplyStatus uint8
 }
 
 func (m MuxPacket) Tag() uint32 {
@@ -51,6 +103,13 @@ type ProtoParser interface {
 type ThriftParser struct {
 }
 
+type ThriftPayload struct {
+	Version     uint16
+	MessageType int
+	Name        string
+	SequenceId  int32
+}
+
 func (p ThriftParser) Parse(r *bytes.Reader) error {
 	l := r.Len()
 	if l < 12 {
@@ -58,21 +117,109 @@ func (p ThriftParser) Parse(r *bytes.Reader) error {
 		return nil
 	}
 
-	// r.ReadByte()
-	// r.ReadByte()
-	// r.ReadByte()
-	// r.ReadByte()
-	v, err := r.ReadByte()
+	var version uint16
+	err := binary.Read(r, binary.BigEndian, &version)
 	if err != nil {
 		return err
 	}
 
 	// int(v) xor 0x80 == 1
-	if int(v) != 128 {
-		fmt.Printf("Payload does not conform to thrift standard: %d\n", int(v))
+	if version != 0x8001 {
+		fmt.Printf("Payload does not conform to thrift standard: %d\n", version)
 		return nil
 	}
 
+	// unused byte as per thrift spec
+	r.ReadByte()
+
+	// Read entire byte, but we are only interested in the 3 bit int
+	msgType, err := r.ReadByte()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Found thrift message of type: %v\n", int(msgType))
+
+	var nameLen int32
+	err = binary.Read(r, binary.BigEndian, &nameLen)
+	if err != nil {
+		return err
+	}
+
+	name, err := ioutil.ReadAll(io.LimitReader(r, int64(nameLen)))
+	if err != nil {
+		return err
+	}
+
+	var seqId int32
+	err = binary.Read(r, binary.BigEndian, &seqId)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Found thrift name length: %d name: %s seq id: %d\n", nameLen, string(name), seqId)
+
+	for {
+		var fieldType uint8
+		err = binary.Read(r, binary.BigEndian, &fieldType)
+		if err != nil {
+			return err
+		}
+
+		if fieldType == 0 {
+			break
+		}
+
+		// fieldId
+		var fieldId int16
+		err = binary.Read(r, binary.BigEndian, &fieldId)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Found field type: %d and ID: %d\n", fieldType, fieldId)
+
+		switch fieldType {
+
+		case ThriftString:
+			// even though this is signed it's expected to be >= 0
+			var strLen int32
+			if err := binary.Read(r, binary.BigEndian, &strLen); err != nil {
+				return err
+			}
+
+			strData, err := ioutil.ReadAll(io.LimitReader(r, int64(strLen)))
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Found string: %s\n", string(strData))
+
+		case ThriftBool:
+			fallthrough
+		case ThriftByte:
+			fallthrough
+		case ThriftDouble:
+			fallthrough
+		case ThriftI16:
+			fallthrough
+		case ThriftI32:
+			fallthrough
+		case ThriftI64:
+			fallthrough
+		case ThriftStruct:
+			fallthrough
+		case ThriftMap:
+			fallthrough
+		case ThriftSet:
+			fallthrough
+		case ThriftList:
+			fallthrough
+		default:
+			panic(fmt.Sprintf("Field type %d not implemented", fieldType))
+		}
+	}
+
+	fmt.Println("Finished parsing thrift message")
 	return nil
 }
 
@@ -114,7 +261,7 @@ func (p MuxParser) Parse(packet gopacket.Packet) error {
 		return err
 	}
 
-	if mux.Type == 127 || mux.Type == -128 {
+	if mux.Type == RerrOld || mux.Type == -128 {
 		why, err := ioutil.ReadAll(r)
 		if err != nil {
 			return err
@@ -122,7 +269,13 @@ func (p MuxParser) Parse(packet gopacket.Packet) error {
 		mux.Why = string(why)
 	}
 
-	if mux.Type == 2 {
+	if mux.Type == Rdispatch {
+		if err := binary.Read(r, binary.BigEndian, &mux.ReplyStatus); err != nil {
+			return err
+		}
+	}
+
+	if mux.Type == Tdispatch || mux.Type == Rdispatch {
 		err = binary.Read(r, binary.BigEndian, &mux.NumCtx)
 		if err != nil {
 			return err
@@ -161,6 +314,10 @@ func (p MuxParser) Parse(packet gopacket.Packet) error {
 			}
 
 			context[string(ctxKey)] = ctxValue
+		}
+
+		if mux.NumCtx == 0 {
+			return p.ApplicationProto.Parse(r)
 		}
 		mux.Ctx = context
 
